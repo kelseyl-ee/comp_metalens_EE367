@@ -12,8 +12,10 @@ from psf_conv import PSFConv
 from im_postprocess import PostProcess
 import config
 
+
 sys.path.append("store_outputs")
 from log_results import log_result
+
 
 
 def get_dataset(name: str):
@@ -32,15 +34,24 @@ def get_dataset(name: str):
     return ds
 
 
-def main(dataset, fc_file_name, target_psf_file_name, num_kernels, kernel_size):
+def main(dataset, fc_file_name, target_psf_file_name, num_kernels, kernel_size, centers_file_name=None):
     # ---- optics / conv objects ----
     asm = ASMPropagator(config)
     pm = PixelMap(config, asm.X, asm.Y)
     conv = PSFConv(config, pm, asm.X, asm.Y)
-    pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
+
+    if centers_file_name is not None:
+        centers = torch.load(centers_file_name, map_location="cpu")
+        pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y, centers=centers, mode="multiplex")
+    else:
+        pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
 
     # ---- load weights ----
     target_psf = torch.load(target_psf_file_name, map_location="cpu")
+
+    if target_psf.ndim == 3:
+        target_psf = target_psf.unsqueeze(1)
+
     pretrained_FC = torch.load(fc_file_name, map_location="cpu")
     W, b = pretrained_FC["weight"], pretrained_FC["bias"]
 

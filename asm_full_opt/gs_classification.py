@@ -18,6 +18,8 @@ from log_results import log_result
 from phase_mask import PhaseMask
 from asm_prop import ASMPropagator
 from pixel_map import PixelMap
+from generate_waves_sv import GenerateWaves
+from process_psf_sv import PSFProcessor
 from psf_conv import PSFConv
 from im_postprocess import PostProcess
 from full_opt_forward import FullOptForward
@@ -27,23 +29,26 @@ import config
 
 # --------------------- Inputs ---------------------- #
 
-DATASET = "CIFAR_G"   # or "Fashion" or "CIFAR_G"
+DATASET = "Fashion"   # or "Fashion" or "CIFAR_G"
+CONFIG_MODE = "multiplex"
 
-NUM_KERNELS = 12
-KERNEL_SIZE = 5
+NUM_KERNELS = 8
+KERNEL_SIZE = 7
 
-BASE = f"store_outputs/{DATASET}_{KERNEL_SIZE}x{KERNEL_SIZE}"
+# BASE = f"store_outputs/{DATASET}_{KERNEL_SIZE}x{KERNEL_SIZE}_{CONFIG_MODE}"
+BASE = f"store_outputs"
 
 PHASE_PATH  = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_phase_init.pt"
+CENTERS_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_target_psf_centers.pt"
 FEATURE_TAG = f"{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}"
 OUT_FC_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_fc_retrained.pt"
 FC_PRE_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_fc_final.pt"
 
-BATCH_OPTICAL = 300   # optical forward batch size
+BATCH_OPTICAL = 256   # optical forward batch size
 BATCH_FC = 64        # FC training batch size
-EPOCHS = 20
-LR = 1e-3
-WEIGHT_DECAY = 0.0
+EPOCHS = 30
+LR = 5e-3
+WEIGHT_DECAY = 1e-9
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -78,7 +83,7 @@ def get_cached_features(cache_dir, split, tag, compute_fn):
     plt.figure(figsize=(cols * 1.5, 3))
     for c in range(C):
         plt.subplot(2, cols, c + 1)
-        plt.imshow(ex0[c].T, cmap="gray", origin="lower")
+        plt.imshow(ex0[c], cmap="gray")
         plt.title(f"ch {c}", fontsize=9)
         plt.axis("off")
 
@@ -100,10 +105,17 @@ def main():
     asm = ASMPropagator(config)
     phase = PhaseMask(config, init="custom", custom=phase_init, X=asm.X, Y=asm.Y)
     pm = PixelMap(config, asm.X, asm.Y)
-    conv = PSFConv(config, pm, asm.X, asm.Y)
-    pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
+    waves = GenerateWaves(config, pm, X=asm.X, Y=asm.Y)
+    processor = PSFProcessor(config)
+    conv = PSFConv(config, pm, processor, asm.X, asm.Y)
 
-    model_opt = FullOptForward(config, phase, asm, conv, pp).to(DEVICE)
+    if CONFIG_MODE == "multiplex":
+        centers = torch.load(CENTERS_PATH, map_location="cpu")
+        pp = PostProcess(config, pixel_map=pm, mode="multiplex",centers=centers, X=asm.X, Y=asm.Y)
+    else:
+        pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
+
+    model_opt = FullOptForward(config, phase, asm, conv, pp, pm, waves, processor).to(DEVICE)
     
     # ---- datasets ----
     transform = transforms.ToTensor()

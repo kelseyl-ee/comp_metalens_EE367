@@ -16,24 +16,31 @@ import ideal_psf_classification
 
 
 # --------------------- Input parameters ---------------------- #
-dataset = "CIFAR_G"
-input_hw = (32, 32)
-num_kernels = 12
-kernel_size = 5
+dataset = "Fashion" # MNIST or Fashion 
+input_hw = (28, 28) if dataset in ["MNIST", "Fashion"] else (32, 32)
+num_kernels = 8
+kernel_size = 7
 
-batch_N = 64
+config_mode = "multiplex" # "array" or "multiplex" -- MAY NEED TO TUNE GRID AND LENS SIZE WHEN SWITCHING
+per_row = 4 # only used if config_mode == "multiplex"
+gap = 75 # only used if config_mode == "multiplex"
+
+batch_N = 128
 use_pool = True
-lr = 1e-3
-num_epoch = 25
+lr = 8e-4
+num_epoch = 15
 
 # Computing target PSF
-upsample=4
+upsample=4 if config_mode == "array" else 2
 mode='bilinear' # nearest or bilinear
 
 # Computing initial phase
-num_masks=2*num_kernels
-phase_guess="hyperbolic"
-num_iter=20
+num_masks = 1 if config_mode == "multiplex" else 2*num_kernels
+phase_guess="hyperbolic" # "random" or "hyperbolic"
+num_iter=70
+
+# Classify with ideal kernel images?
+class_w_ideal_PSF = True
 
 tag = f"{dataset}_{num_kernels}x{kernel_size}x{kernel_size}"
 
@@ -94,6 +101,9 @@ if not (os.path.exists(psf_path)):
         kernel_path,
         upsample=upsample,
         mode=mode,
+        config_mode=config_mode,
+        per_row=per_row,
+        gap=gap,
         save_name=psf_path       
     )
 
@@ -106,19 +116,28 @@ else:
 #                    Classify w Ideal PSF                        #
 # -------------------------------------------------------------- #
 
-out_dir = Path(__file__).resolve().parents[1] / "store_outputs"
-os.makedirs(out_dir, exist_ok=True)
+if class_w_ideal_PSF:
+    out_dir = Path(__file__).resolve().parents[1] / "store_outputs"
+    os.makedirs(out_dir, exist_ok=True)
 
-psf_path = os.path.join(out_dir, save_name_psf)
-fc_path = os.path.join(out_dir, save_name_trained_fc)
+    psf_path = os.path.join(out_dir, save_name_psf)
+    fc_path = os.path.join(out_dir, save_name_trained_fc)
 
-ideal_psf_classification.main(
-    dataset=dataset,
-    fc_file_name=fc_path,
-    target_psf_file_name=psf_path,
-    num_kernels=num_kernels,
-    kernel_size=kernel_size,
-)
+    if config_mode == "multiplex":
+        centers_path = os.path.join(out_dir, f"{tag}_target_psf_centers.pt")
+        if not os.path.exists(centers_path):
+            raise ValueError(f"Expected centers file at {centers_path} for multiplex mode. Please run kernel_to_psf to generate it.")
+    else:        
+        centers_path = None
+
+    ideal_psf_classification.main(
+        dataset=dataset,
+        fc_file_name=fc_path,
+        target_psf_file_name=psf_path,
+        num_kernels=num_kernels,
+        kernel_size=kernel_size,
+        centers_file_name=centers_path
+    )
 
 
 # -------------------------------------------------------------- #

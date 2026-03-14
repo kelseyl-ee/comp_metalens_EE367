@@ -162,11 +162,10 @@ class PhaseMask(nn.Module):
         """
         Apply phase mask(s) to a single complex field U.
 
-        U:   (N, N) complex
+        U:   (N, N) or (K, N, N) complex
         out: (K, N, N) complex
         """
-        if U.ndim != 2:
-            raise ValueError(f"Expected U to have shape (N, N). Got {tuple(U.shape)}")
+        U_2d = U.squeeze() if U.ndim == 3 else U
 
         phi = self.forward().to(device=U.device)   
         phase = torch.exp(1j * phi)                
@@ -175,4 +174,6 @@ class PhaseMask(nn.Module):
             A = self.A.to(device=U.device)         
             phase = phase * A[None, :, :]          
 
-        return U[None, :, :] * phase               # (K, N, N)
+        return U_2d[None, :, :] * phase               # (K, N, N)
+
+

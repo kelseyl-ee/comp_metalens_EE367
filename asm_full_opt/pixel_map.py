@@ -35,6 +35,11 @@ class PixelMap(nn.Module):
         self.lens_D = config.LENS_D
         self.dx = config.PIX_SIZE
 
+        self.field_strategy = config.FIELD_STRATEGY
+        self.block_size = config.BLOCK_SIZE
+        self.register_buffer("uv_samples", None, persistent=False)
+        self.register_buffer("pixel_to_sample", None, persistent=False)
+
         if X is None and Y is None:
             self.build_spatial_grid()
         else:
@@ -66,7 +71,7 @@ class PixelMap(nn.Module):
         return uv_hw
     
     
-    def uv_to_angles(self, uv_samples, hfov_deg=None):
+    def uv_to_angles(self, uv_samples, hfov_deg=None, store=True):
             """
             Map object-plane sample coordinates (u,v) to field angles (theta_x, theta_y),
             enforcing: (u,v) = (0.5, 0.5) -> ( +HFOV/sqrt(2), -HFOV/sqrt(2) )
@@ -105,8 +110,9 @@ class PixelMap(nn.Module):
 
             theta_x = torch.atan(-u_n * math.tan(a))
             theta_y = torch.atan( v_n * math.tan(a))
-            self.theta_x = theta_x
-            self.theta_y = theta_y
+            if store:
+                self.theta_x = theta_x
+                self.theta_y = theta_y
 
             return theta_x, theta_y
 
@@ -122,8 +128,8 @@ class PixelMap(nn.Module):
         tx = torch.as_tensor(theta_x, device=self.device_, dtype=self.dtype_)
         ty = torch.as_tensor(theta_y, device=self.device_, dtype=self.dtype_)
 
-        sensor_x = f * torch.tan(tx)
-        sensor_y = f * torch.tan(ty)
+        sensor_x = -f * torch.tan(tx)
+        sensor_y = -f * torch.tan(ty)
 
         return sensor_x, sensor_y
 
@@ -357,6 +363,83 @@ class PixelMap(nn.Module):
         )
         return sensor_ideal
     
+    ## ------------------- Spatially varying ------------------------------   
+
+    def sample_field_points(self, strategy=None, block_size=None):
+        """
+        Determines PSF sample locations and creates a pixel-to-sample routing map.
+        Uses the pixel-center convention from pixel_uv_grid.
+        """
+        H, W = self.H_obj, self.W_obj
+        strategy = (strategy or self.field_strategy).lower()
+        B = block_size or self.block_size
+
+        if strategy == "full":
+            uv_samples = self.pixel_uv_grid(H=H, W=W, flatten=True)
+            
+            # pixel_to_sample mapping: p = u * H + v
+            u_idx = torch.arange(W, device=self.device_, dtype=torch.long).view(1, W)
+            v_idx = torch.arange(H, device=self.device_, dtype=torch.long).view(H, 1)
+            pixel_to_sample = u_idx * H + v_idx
+
+        elif strategy == "block":
+            # Calculate number of blocks
+            nBH = (H + B - 1) // B
+            nBW = (W + B - 1) // B
+
+            # Calculate block centers in pixel-coordinates
+            u_c = []
+            for j in range(nBW):
+                u0, u1 = j * B, min((j + 1) * B - 1, W - 1)
+                u_c.append((u0 + u1 + 1) / 2.0) # Midpoint of pixel centers
+            
+            v_c = []
+            for i in range(nBH):
+                v0, v1 = i * B, min((i + 1) * B - 1, H - 1)
+                v_c.append((v0 + v1 + 1) / 2.0)
+
+            u_centers = torch.tensor(u_c, device=self.device_, dtype=self.dtype_)
+            v_centers = torch.tensor(v_c, device=self.device_, dtype=self.dtype_)
+
+            # Create the sample list [P, 2]
+            U_c, V_c = torch.meshgrid(u_centers, v_centers, indexing="ij")
+            uv_samples = torch.stack([U_c.reshape(-1), V_c.reshape(-1)], dim=-1)
+
+            # Map every pixel to its block index
+            v_idx = torch.arange(H, device=self.device_, dtype=torch.long).view(H, 1)
+            u_idx = torch.arange(W, device=self.device_, dtype=torch.long).view(1, W)
+
+            block_v = torch.div(v_idx, B, rounding_mode="floor")
+            block_u = torch.div(u_idx, B, rounding_mode="floor")
+            
+            # Indexing: p = block_u * nBH + block_v
+            pixel_to_sample = block_u * nBH + block_v
+        
+        else:
+            raise ValueError(f"Strategy '{strategy}' not recognized.")
+
+        # Store and return
+        self.uv_samples = uv_samples
+        self.pixel_to_sample = pixel_to_sample
+        return uv_samples, pixel_to_sample 
+    
+
+    def angles_to_k(self, theta_x, theta_y):
+        """
+        Convert field angles to transverse wavevectors (kx, ky).
+        """
+        wavl = float(self.wavl)
+        k0 = (2.0 * math.pi) / wavl
+
+        tx = torch.as_tensor(theta_x, device=self.device_, dtype=self.dtype_)
+        ty = torch.as_tensor(theta_y, device=self.device_, dtype=self.dtype_)
+
+        kx = k0 * torch.sin(tx)
+        ky = k0 * torch.sin(ty)
+
+        return kx, ky
+    
+
     #--------------------------------------------------------------------
     def build_spatial_grid(self):
         """

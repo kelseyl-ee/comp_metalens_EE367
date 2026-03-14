@@ -18,6 +18,8 @@ from log_results import log_result
 from phase_mask import PhaseMask
 from asm_prop import ASMPropagator
 from pixel_map import PixelMap
+from generate_waves_sv import GenerateWaves
+from process_psf_sv import PSFProcessor
 from psf_conv import PSFConv
 from im_postprocess import PostProcess
 from full_opt_forward import FullOptForward
@@ -28,16 +30,18 @@ import config
 # --------------------- Inputs ---------------------- #
 
 DATASET = "Fashion"   # or "Fashion" or "CIFAR_G"
+CONFIG_MODE = "multiplex"
 
 NUM_KERNELS = 8
 KERNEL_SIZE = 7
 
-BASE = f"store_outputs/{DATASET}_{KERNEL_SIZE}x{KERNEL_SIZE}"
+BASE = f"store_outputs"
 
 OUT_PHASE_DIR = Path(BASE) / "phase_checkpoints"
 OUT_PHASE_DIR.mkdir(parents=True, exist_ok=True)
 
 PHASE_PATH  = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_phase_init.pt"
+CENTERS_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_target_psf_centers.pt"
 FC_PATH    = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_fc_final.pt"
 FEATURE_TAG = f"{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}"
 OUT_FC_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_fc_trained.pt"
@@ -45,9 +49,9 @@ OUT_PHASE_PATH = f"{BASE}/{DATASET}_{NUM_KERNELS}x{KERNEL_SIZE}x{KERNEL_SIZE}_ph
 
 BATCH_EVAL = 256
 BATCH = 64 
-EPOCHS = 12
+EPOCHS = 2
 LR_PHASE = 5e-4
-LR_FC = 1e-4
+LR_FC = 3e-3
 WEIGHT_DECAY = 0.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,12 +97,18 @@ def main():
 
     # ---- build optical pipeline ----
     asm = ASMPropagator(config)
-    phase = PhaseMask(config, init="custom", trainable=True, custom=phase_init, X=asm.X, Y=asm.Y)
+    phase = PhaseMask(config, init="custom", custom=phase_init, X=asm.X, Y=asm.Y)
     pm = PixelMap(config, asm.X, asm.Y)
-    conv = PSFConv(config, pm, asm.X, asm.Y)
-    pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
+    waves = GenerateWaves(config, pm, X=asm.X, Y=asm.Y)
+    processor = PSFProcessor(config)
+    conv = PSFConv(config, pm, processor, asm.X, asm.Y)
+    if CONFIG_MODE == "multiplex":
+        centers = torch.load(CENTERS_PATH, map_location="cpu")
+        pp = PostProcess(config, pixel_map=pm, mode="multiplex",centers=centers, X=asm.X, Y=asm.Y)
+    else:
+        pp = PostProcess(config, pixel_map=pm, X=asm.X, Y=asm.Y)
 
-    model_opt = FullOptForward(config, phase, asm, conv, pp).to(DEVICE)
+    model_opt = FullOptForward(config, phase, asm, conv, pp, pm, waves, processor).to(DEVICE)
     
     # ---- datasets ----
     transform = transforms.ToTensor()
@@ -276,7 +286,7 @@ def main():
 
     # ---- plot phase evolution (all snapshots) ----
 
-    K = 4   # number of phase masks
+    K = 1   # number of phase masks
 
     # select snapshots: init + every other epoch
     snap_indices = list(range(0, len(phase_snaps), 2))
@@ -290,9 +300,17 @@ def main():
 
     for r in range(K):                 # each phase mask
         for c, (phi_all, title) in enumerate(zip(phases_sel, titles_sel)):
+            if phi_all.ndim == 2:
+                phi = phi_all
+            else:
+                idx_mask = min(r, phi_all.shape[0] - 1)
+                phi = phi_all[idx_mask]
+
             idx = r * n_cols + c + 1
             plt.subplot(n_rows, n_cols, idx)
-            plt.imshow(phi_all[r].T, cmap="twilight", origin="lower")
+            phi_wrapped = ((phi + torch.pi) % (2 * torch.pi)) - torch.pi
+            plt.imshow(phi_wrapped.T, cmap="twilight", origin="lower", vmin=-torch.pi, vmax=torch.pi)
+
             if r == 0:
                 plt.title(title, fontsize=9)
             if c == 0:
@@ -319,13 +337,13 @@ def main():
 
     # batch-level running avg (x = global step)
     if len(batch_step_hist) > 0:
-        plt.plot(batch_step_hist, batch_loss_hist, color='k',label="train loss (batch running avg)")
+        plt.plot(batch_step_hist, batch_loss_hist, color='gray', linewidth=1, label="train loss (batch running avg)")
 
     # epoch-level losses (x = step at end of each epoch)
     steps_per_epoch = len(train_loader)
     epoch_steps = [steps_per_epoch * e for e in range(1, len(train_loss_hist) + 1)]
-    plt.plot(epoch_steps, train_loss_hist, marker="o", color='blue', label="train loss (epoch avg)")
-    plt.plot(epoch_steps, val_loss_hist, marker="o", color='red', label="val loss (epoch avg)")
+    plt.plot(epoch_steps, train_loss_hist, color='blue', label="train loss (epoch avg)")
+    plt.plot(epoch_steps, val_loss_hist, color='red', label="val loss (epoch avg)")
 
     plt.xlabel("Training step")
     plt.ylabel("Cross-entropy loss")
@@ -345,7 +363,7 @@ def main():
     plt.figure(figsize=(6, 4))
 
     epochs = list(range(1, len(val_acc_hist) + 1))
-    plt.plot(epochs, np.array(val_acc_hist) * 100, color='blue', marker="o", label="val acc")
+    plt.plot(epochs, np.array(val_acc_hist) * 100, color='blue', marker="s", label="val acc")
 
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")

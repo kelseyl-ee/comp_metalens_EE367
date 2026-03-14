@@ -35,6 +35,9 @@ class PhaseGS(nn.Module):
 
         self.phase = phase
         self.asm = asm
+
+        if psf_ideal.ndim == 4:
+            psf_ideal = psf_ideal.squeeze(1)
         self.psf_ideal = psf_ideal
 
         self.register_buffer("X", asm.X)
@@ -74,13 +77,16 @@ class PhaseGS(nn.Module):
             raise ValueError(f"Shape mismatch: g {tuple(g.shape)} vs psf_ideal {tuple(psf_ideal.shape)}")
 
         psf, Gz = self.asm(phase_mask=self.phase, normalize=True, return_field=True)
+        Gz = self._collapse_to_knn(Gz)
+
         self.G = Gz
 
         # --- Image-plane amplitude constraint ---
         A_target = torch.sqrt(torch.clamp(psf_ideal, min=0.0))  # [K,N,N] amplitude target
         phase_z = torch.angle(Gz)                               # keep current phase
 
-        Gz_prime = A_target * torch.exp(1j * phase_z)  # [K,N,N] complex
+        Gz_prime = A_target * torch.exp(1j * phase_z)
+        Gz_prime = self._collapse_to_knn(Gz_prime)  
 
         self.G_prime = Gz_prime
 
@@ -99,12 +105,14 @@ class PhaseGS(nn.Module):
             apply_phase=False,
             normalize=False                 
         )
-        self.g_prime = g_prime  # [K,N,N] complex
+        g_prime = self._collapse_to_knn(g_prime)
+        self.g_prime = g_prime
 
         new_phase = torch.angle(g_prime)
         self.phase.phi = new_phase * self.A_mask
 
         g_iter = self.phase.apply(self.A)
+        g_iter = self._collapse_to_knn(g_iter)
         self.g = g_iter
 
         return self.g
@@ -128,6 +136,20 @@ class PhaseGS(nn.Module):
                 print(f"Iteration {i+1}/{num_iters} - RMSE: {rmse.item():.2e}")
 
         return self.phase.phi
+
+
+
+    def _collapse_to_knn(self, x):
+        if x.ndim == 4:
+            if x.shape[0] == 1:
+                x = x.squeeze(0)   # [1,K,N,N] -> [K,N,N]
+            elif x.shape[1] == 1:
+                x = x.squeeze(1)   # [K,1,N,N] -> [K,N,N]
+            else:
+                raise ValueError(f"Expected a singleton in dim 0 or 1, got shape {tuple(x.shape)}")
+        if x.ndim != 3:
+            raise ValueError(f"Expected [K,N,N], got shape {tuple(x.shape)}")
+        return x
 
 
 
@@ -162,7 +184,7 @@ def main(
     with torch.no_grad():
         final_psf, Ufinal = gs.asm(phase_mask=gs.phase, normalize=True, return_field=True)
     
-    print("Ufinal intensity sum:", (Ufinal[0].abs()**2).sum().item())
+    # print("Ufinal intensity sum:", (Ufinal[5].abs()**2).sum().item())
     torch.save(gs.phase.phi.cpu(), save_name)
     print(f"Saved init phase to {save_name}")
     
@@ -171,29 +193,41 @@ def main(
     # plot 1
     phi = gs.phase.phi.detach().cpu()
     K = phi.shape[0]
-    cols = 4
-    rows = math.ceil(K / cols)
+    if K == 1:
+        plt.figure(figsize=(5,5))
+        plt.imshow(phi[0].T, cmap="twilight", origin="lower")
+        plt.axis("off")
+    else:
+        cols = 4
+        rows = math.ceil(K / cols)
 
-    fig, axes = plt.subplots(rows, cols, figsize=(2*cols, 2*rows))
-    axes = axes.flatten()
+        fig, axes = plt.subplots(rows, cols, figsize=(2*cols, 2*rows))
+        axes = axes.flatten()
 
-    for k in range(K):
-        axes[k].imshow(phi[k].T, cmap="twilight", origin="lower")
-        axes[k].set_title(f"Phase {k}", fontsize=9)
-        axes[k].axis("off")
+        for k in range(K):
+            axes[k].imshow(phi[k].T, cmap="twilight", origin="lower")
+            # axes[k].set_title(f"Phase {k}", fontsize=9)
+            axes[k].axis("off")
 
-    for k in range(K, len(axes)):
-        axes[k].axis("off")
+        for k in range(K, len(axes)):
+            axes[k].axis("off")
 
     plt.tight_layout()
     png_name = os.path.splitext(save_name)[0] + ".png"
     plt.savefig(png_name, dpi=300, bbox_inches="tight")
     plt.show()
-    
+        
     # plot 2
 
-    num_display = min(6, gs.phase.phi.shape[0])
-    fig, axes = plt.subplots(3, num_display, figsize=(2*num_display, 6))
+    num_display = min(16, gs.phase.phi.shape[0])
+    if num_display == 1:
+        fig, axes = plt.subplots(3, num_display, figsize=(2.5*num_display, 7.5))
+    else:
+        fig, axes = plt.subplots(3, num_display, figsize=(1*num_display, 3))
+
+    axes = np.array(axes)
+    if axes.ndim == 1:              # happens when num_display == 1
+        axes = axes.reshape(3, 1)   
 
     with torch.no_grad():
         final_psf = gs.asm(phase_mask=gs.phase, normalize=True)
@@ -203,9 +237,9 @@ def main(
         axes[1,k].imshow(final_psf[k].T.cpu(), cmap="inferno", origin="lower")
         axes[2,k].imshow(gs.psf_ideal[k].T.cpu(), cmap="inferno", origin="lower")
 
-        axes[0,k].set_title(f"K{k} Phase", fontsize=9)
-        axes[1,k].set_title(f"K{k} Opt", fontsize=9)
-        axes[2,k].set_title(f"K{k} Target", fontsize=9)
+        # axes[0,k].set_title(f"K{k} Phase", fontsize=9)
+        # axes[1,k].set_title(f"K{k} Opt", fontsize=9)
+        # axes[2,k].set_title(f"K{k} Target", fontsize=9)
 
         for i in range(3): axes[i,k].axis("off")
 

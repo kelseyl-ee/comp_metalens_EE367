@@ -20,6 +20,7 @@ class ASMPropagator(nn.Module):
         self.build_frequency_grids()
         self.build_transfer_function()
 
+
     def build_spatial_grid(self):
         """
         Builds a centered spatial grid at the metalens plane.
@@ -40,6 +41,8 @@ class ASMPropagator(nn.Module):
 
         return x, y, X, Y
 
+
+
     def build_frequency_grids(self):
         """
         Build spatial-frequency grids matching torch.fft.fft2 ordering.
@@ -58,7 +61,8 @@ class ASMPropagator(nn.Module):
         self.register_buffer("FY", FY)
 
         return fx, fy, FX, FY
-    
+
+
 
     def generate_on_axis_plane_wave(self, normalize=True):
         """
@@ -103,50 +107,57 @@ class ASMPropagator(nn.Module):
         return H
 
 
-    def forward(self, phase_mask, U0_stack=None, normalize=False, return_field=False, H=None, apply_phase=True):
-        """
-        Apply phase mask and ASM propagate a batch of fields, returning PSFs.
-
-        Returns
-        -------
-        psf_stack : torch.Tensor, shape [P,N,N], float
-        (optional) Uz_stack : torch.Tensor, shape [P,N,N], complex
-        """
-        if U0_stack is None:
-            U0 = self.generate_on_axis_plane_wave()  
-        else:
-            U0 = torch.as_tensor(U0_stack, device=self.device_)
-
-        # Ensure complex
+    
+    def forward(self, phase_mask, U0_stack=None, batch_size=None, normalize=False, 
+                return_field=False, H=None, apply_phase=True):
+        
+        # 1. Standardize U0 to [P, N, N]
+        U0 = torch.as_tensor(U0_stack if U0_stack is not None 
+                             else self.generate_on_axis_plane_wave(), device=self.device_)
+        if U0.ndim == 2:
+            U0 = U0.unsqueeze(0)
+        if U0.ndim != 3:
+            raise ValueError(f"U0_stack must be 2D or 3D, got shape {tuple(U0.shape)}")
         if not torch.is_complex(U0):
             U0 = U0.to(torch.complex64)
-
-        if H is None:
-            H = self.H
-        H = H.to(device=U0.device)
+            
+        H = self.H if H is None else H.to(U0.device)
         if not torch.is_complex(H):
             H = H.to(torch.complex64)
 
-        # Apply phase 
-        if apply_phase:
-            U_lens = phase_mask.apply(U0)
-        else:
-            U_lens = U0
+        P = U0.shape[0] # Number of field points
+        chunk_size = batch_size or P
+        
+        all_psfs, all_fields = [], []
 
-        # FFT -> multiply -> IFFT 
-        U_f = torch.fft.fft2(U_lens)
-        U_f_prop = U_f * H  
-        Uz = torch.fft.ifft2(U_f_prop)
+        for i in range(0, P, chunk_size):
+            U0_chunk = U0[i : i + chunk_size] # [chunk, N, N]
+            
+            if apply_phase:
+                # Build pure transmission masks (phase/aperture only) using a unit field.
+                # This avoids accidentally multiplying by the input field twice.
+                unit_field = torch.ones_like(U0_chunk[0])
+                masks = phase_mask.apply(unit_field)
+                if masks.ndim == 2:
+                    masks = masks.unsqueeze(0)
+                U_lens = masks.unsqueeze(1) * U0_chunk.unsqueeze(0)
+            else:
+                U_lens = U0_chunk.unsqueeze(0) # Results in [1, chunk, N, N]
 
-        psf = torch.abs(Uz) ** 2  # [P,N,N], float
+            # 2. Propagate
+            Uz_chunk = torch.fft.ifft2(torch.fft.fft2(U_lens) * H)
+            psf_chunk = Uz_chunk.abs()**2
 
-        if normalize:
-            eps = 1e-12
-            energy = Uz.abs().square().sum(dim=(-2, -1), keepdim=True) + eps
-            Uz = Uz * torch.rsqrt(energy)
-            psf = Uz.abs().square()
+            if normalize:
+                psf_chunk = psf_chunk / (psf_chunk.sum(dim=(-2, -1), keepdim=True) + 1e-12)
 
+            all_psfs.append(psf_chunk)
+            if return_field: all_fields.append(Uz_chunk)
+
+        # 3. Final Assembly: Cat along dim 1 (the field/chunk dimension)
+        psf_final = torch.cat(all_psfs, dim=1) 
+        
         if return_field:
-            return psf, Uz
-        else:
-            return psf
+            return psf_final, torch.cat(all_fields, dim=1)
+        
+        return psf_final

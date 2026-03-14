@@ -21,7 +21,7 @@ NM = 1E-9
 
 class FullOptForward(nn.Module):
 
-    def __init__(self, config, phase, asm, conv, pp):
+    def __init__(self, config, phase, asm, conv, pp, pm=None, waves=None, psf_processor=None):
 
         super().__init__()
         self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,15 +32,31 @@ class FullOptForward(nn.Module):
         self.asm = asm
         self.conv = conv
         self.pp = pp
+
+        # For spatially varying model
+        self.pm = pm
+        self.waves = waves
+        self.psf_processor = psf_processor
+
+        if self.waves is not None:
+            self.waves.generate_plane_wave_stack()
+
   
     
-    def optical_forward(self, objs, *, normalize_psf=True):
+    def optical_forward(self, objs, *, normalize_psf=True, out_psfs=False):
         """
         objs: expected [B, 1, H, W] 
-        returns imgs: [B, K, 255, 255] 
+        returns imgs: [B, L, 255, 255] 
         """
-        psfs = self.asm(phase_mask=self.phase, normalize=normalize_psf)
+        if not self.config.SV:
+            psfs = self.asm(phase_mask=self.phase, normalize=normalize_psf)
+        else:
+            psfs_sv = self.asm(phase_mask=self.phase, U0_stack=self.waves.U0, normalize=normalize_psf)
+            psfs = self.psf_processor(psfs_sv, self.pm, self.waves)
+
         imgs = self.conv.sensor_image(objs, psfs)
+        if out_psfs:
+            return imgs, psfs
         return imgs
 
 

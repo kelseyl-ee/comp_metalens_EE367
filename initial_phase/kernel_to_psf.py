@@ -94,6 +94,7 @@ class Kernel2PSF(nn.Module):
         return centered
     
 
+
     def rearrange_kernels(self, raw_kernels, per_row: int):
         """ 
         rearrange split kernels for PSF grid
@@ -121,9 +122,9 @@ class Kernel2PSF(nn.Module):
             start = end
 
         return out
-    
 
-    def stitch_and_center(self, kernels, upsample=1, upsample_mode="nearest",per_row=4, gap=10, grid_N=255):
+
+    def stitch_and_center(self, kernels, upsample=1, upsample_mode="nearest", per_row=4, gap=10):
         # kernels: (K, n, n)
         if kernels.ndim != 3:
             raise ValueError(f"Expected (K,n,n). Got {tuple(kernels.shape)}")
@@ -147,6 +148,7 @@ class Kernel2PSF(nn.Module):
             stitched[y0:y0+n, x0:x0+n] = kernels[idx]
             centers_in_stitched[idx] = torch.tensor([y0 + n//2 - 1, x0 + n//2 - 1], device=kernels.device)
 
+        grid_N = self.grid_N
         if H > grid_N or W > grid_N:
             raise ValueError(f"Stitched image {H}x{W} larger than grid {grid_N}x{grid_N}")
 
@@ -154,6 +156,7 @@ class Kernel2PSF(nn.Module):
         y0 = (grid_N - H) // 2
         x0 = (grid_N - W) // 2
         out[y0:y0+H, x0:x0+W] = stitched
+        out = out.unsqueeze(0)
 
         centers_in_grid = centers_in_stitched + torch.tensor([y0, x0], device=kernels.device)
 
@@ -194,8 +197,11 @@ def plot_target_psfs(psf_grid, file_name=None):
 
 def main(
     kernel_file_name,
-    upsample=4,
+    upsample=2,
     mode="nearest", # nearest or bilinear
+    config_mode="array",
+    per_row=None,
+    gap=None,
     save_name="Default_MNIST_target_psf_7x7.pt"
 ):
     # ---- Load learned kernels ----
@@ -204,23 +210,64 @@ def main(
     print("kernels shape:", kernels.shape)
 
     # ---- Kernel → PSF pipeline ----
-    k2p = Kernel2PSF(config)
+    k2psf = Kernel2PSF(config)
 
-    raw_kernels = k2p.split_kernels(kernels)      # eg. [16,7,7]
-    print("raw_kernels shape:", raw_kernels.shape)
+    if config_mode == "array":
+        raw_kernels = k2psf.split_kernels(kernels)
+        print("raw_kernels shape:", raw_kernels.shape)
 
-    psf_grid = k2p.upsample_and_center_kernels(
-        raw_kernels,
-        upsample=upsample,
-        mode=mode  
-    )
-    print("psf_grid shape:", psf_grid.shape)
+        psf_grid = k2psf.upsample_and_center_kernels(
+            raw_kernels,
+            upsample=upsample,
+            mode=mode,
+        )
+        print("psf_grid shape:", psf_grid.shape)
 
-    torch.save(psf_grid.cpu(), save_name)
-    print(f"Saved psf_grid to {save_name}")
+        torch.save(psf_grid.cpu(), save_name)
+        print(f"Saved psf_grid to {save_name}")
 
-    # ---- Plot  ----
-    plot_target_psfs(psf_grid, file_name=save_name)
+        plot_target_psfs(psf_grid, file_name=save_name)
+
+    elif config_mode == "multiplex":
+        pr = per_row if per_row is not None else 4
+
+        raw_kernels = k2psf.split_kernels(kernels)
+        print("raw_kernels shape:", raw_kernels.shape)
+
+        raw_kernels = k2psf.rearrange_kernels(raw_kernels, per_row=pr)
+
+        stitched, centers = k2psf.stitch_and_center(
+            raw_kernels,
+            upsample=upsample,
+            per_row=pr,
+            gap=gap,
+        )
+        stitched = stitched[0].T.flip(1).unsqueeze(0)
+
+        print("Stitched PSF shape:", stitched.shape)
+        print("Centers shape:", centers.shape)
+
+        # ---- save both ----
+        torch.save(stitched.cpu(), save_name)
+
+        centers_path = save_name.replace(".pt", "_centers.pt")
+        torch.save(centers.cpu() if torch.is_tensor(centers) else centers, centers_path)
+
+        print(f"Saved stitched PSF to {save_name}")
+        print(f"Saved centers to {centers_path}")
+
+        plt.figure(figsize=(4, 4))
+        plt.imshow(stitched[0].T.cpu(), cmap="gray", origin="lower")
+        plt.title("Target PSF")
+        plt.axis("off")
+        plt.tight_layout()
+
+        png_name = os.path.splitext(save_name)[0] + ".png"
+        plt.savefig(png_name, dpi=300, bbox_inches="tight")
+        plt.show()
+
+    else:
+        raise ValueError(f"Unknown config_mode: {config_mode}")
 
 
 if __name__ == "__main__":
