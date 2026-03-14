@@ -221,13 +221,11 @@ __marimo__/
 .DS_Store
 
 # data / outputs (project-specific)
-data/
-store_outputs/
+# data/
 digital_baseline/
 *.csv
 
 # torch / numpy / misc artifacts
-*.pt
 *.pth
 *.npz
 *.npy
